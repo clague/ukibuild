@@ -87,6 +87,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          AUR_PACKAGE="${AUR_PACKAGE:-ukibuild}"
+          AUR_PACKAGE="${AUR_PACKAGE//[[:space:]]/}"
+          if [[ -z $AUR_PACKAGE ]]; then
+            echo "::error::AUR_PACKAGE is empty"
+            exit 1
+          fi
+          echo "::notice::AUR package: $AUR_PACKAGE"
+
           if [[ -z ${AUR_SSH_PRIVATE_KEY:-} ]]; then
             echo "::error::AUR_SSH_PRIVATE_KEY is not set"
             exit 1
@@ -95,7 +103,22 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" >~/.ssh/aur
           chmod 600 ~/.ssh/aur
-          ssh-keyscan aur.archlinux.org >>~/.ssh/known_hosts
+
+          if ! grep -q 'BEGIN .*PRIVATE KEY' ~/.ssh/aur; then
+            echo "::error::AUR_SSH_PRIVATE_KEY does not contain a private key"
+            exit 1
+          fi
+          if ! ssh-keygen -y -P '' -f ~/.ssh/aur >/tmp/aur.pub 2>/dev/null; then
+            echo "::error::AUR_SSH_PRIVATE_KEY is invalid or passphrase-protected; use an unencrypted private key"
+            exit 1
+          fi
+          key_fp=$(ssh-keygen -lf /tmp/aur.pub | awk '{print $2}')
+          echo "::notice::AUR SSH key fingerprint: $key_fp"
+
+          if ! ssh-keyscan aur.archlinux.org >>~/.ssh/known_hosts 2>/dev/null; then
+            echo "::error::ssh-keyscan aur.archlinux.org failed"
+            exit 1
+          fi
           cat >~/.ssh/config <<'EOF'
           Host aur.archlinux.org
             User aur
@@ -112,9 +135,11 @@ jobs:
           rm -rf /tmp/aur
           # A new package is cloned as an empty repository; the first push
           # creates it. A failure here means SSH authentication is wrong.
-          if ! git -c init.defaultBranch=master clone \
-                "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" /tmp/aur; then
-            echo "::error::Could not clone the AUR repository. Check AUR_SSH_PRIVATE_KEY and that the matching public key is added to your AUR account."
+          if ! clone_out=$(git -c init.defaultBranch=master clone \
+                "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" /tmp/aur 2>&1); then
+            printf '%s\n' "$clone_out"
+            detail=$(printf '%s\n' "$clone_out" | tail -n 3 | tr '\n' ' ')
+            echo "::error::AUR clone failed: $detail"
             exit 1
           fi
 
