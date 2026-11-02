@@ -100,32 +100,38 @@ jobs:
             exit 1
           fi
 
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" >~/.ssh/aur
-          chmod 600 ~/.ssh/aur
+          SSH_DIR="${RUNNER_TEMP:-/tmp}/aur-ssh"
+          rm -rf "$SSH_DIR"
+          install -d -m 700 "$SSH_DIR"
+          KEY="$SSH_DIR/aur"
+          CONFIG="$SSH_DIR/config"
+          KNOWN="$SSH_DIR/known_hosts"
 
-          if ! grep -q 'BEGIN .*PRIVATE KEY' ~/.ssh/aur; then
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" >"$KEY"
+          chmod 600 "$KEY"
+
+          if ! grep -q 'BEGIN .*PRIVATE KEY' "$KEY"; then
             echo "::error::AUR_SSH_PRIVATE_KEY does not contain a private key"
             exit 1
           fi
-          if ! ssh-keygen -y -P '' -f ~/.ssh/aur >/tmp/aur.pub 2>/dev/null; then
+          if ! ssh-keygen -y -P '' -f "$KEY" >"$SSH_DIR/aur.pub" 2>/dev/null; then
             echo "::error::AUR_SSH_PRIVATE_KEY is invalid or passphrase-protected; use an unencrypted private key"
             exit 1
           fi
-          key_fp=$(ssh-keygen -lf /tmp/aur.pub | awk '{print $2}')
+          key_fp=$(ssh-keygen -lf "$SSH_DIR/aur.pub" | awk '{print $2}')
           echo "::notice::AUR SSH key fingerprint: $key_fp"
 
-          cat >~/.ssh/config <<'EOF'
+          cat >"$CONFIG" <<EOF
           Host aur.archlinux.org
             User aur
-            IdentityFile ~/.ssh/aur
+            IdentityFile $KEY
             IdentitiesOnly yes
+            UserKnownHostsFile $KNOWN
             StrictHostKeyChecking accept-new
           EOF
-          chmod 600 ~/.ssh/config
+          chmod 600 "$CONFIG"
 
-          ssh -vv -o BatchMode=yes -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=accept-new -T aur@aur.archlinux.org \
+          ssh -F "$CONFIG" -vv -o BatchMode=yes -T aur@aur.archlinux.org \
             >/tmp/aur-ssh.log 2>&1 || true
           if grep -q 'Authentication succeeded' /tmp/aur-ssh.log; then
             echo "::notice::AUR SSH authentication succeeded"
@@ -137,6 +143,7 @@ jobs:
           git config --global user.name "AUR Publisher"
           git config --global user.email "aur@localhost"
           git config --global init.defaultBranch master
+          export GIT_SSH_COMMAND="ssh -F $CONFIG"
 
           rm -rf /tmp/aur
           # A new package is cloned as an empty repository; the first push
