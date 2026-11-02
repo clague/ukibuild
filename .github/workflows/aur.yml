@@ -110,8 +110,11 @@ jobs:
           git config --global init.defaultBranch master
 
           rm -rf /tmp/aur
-          if ! git clone "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" /tmp/aur; then
-            echo "::error::AUR package '${AUR_PACKAGE}' does not exist; create it first"
+          # A new package is cloned as an empty repository; the first push
+          # creates it. A failure here means SSH authentication is wrong.
+          if ! git -c init.defaultBranch=master clone \
+                "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" /tmp/aur; then
+            echo "::error::Could not clone the AUR repository. Check AUR_SSH_PRIVATE_KEY and that the matching public key is added to your AUR account."
             exit 1
           fi
 

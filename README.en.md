@@ -410,9 +410,11 @@ packaging/aur/
 
 First-time setup:
 
-- Create the `ukibuild` package on AUR
-- Add the AUR SSH public key to the AUR account
+- Have an AUR account and add the AUR SSH public key to it
 - Add the `AUR_SSH_PRIVATE_KEY` secret on GitHub
+
+You do **not** need to create the package in the AUR web interface. A new
+package clones as an empty repository, and the first push creates it.
 
 See `packaging/aur/README.md` for details.
 

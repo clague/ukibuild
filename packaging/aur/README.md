@@ -22,7 +22,8 @@ On a `v*` tag (or manual dispatch):
 5. Generates `.SRCINFO`.
 6. Builds the package with `makepkg -s -f` to validate it.
 7. Clones `ssh://aur@aur.archlinux.org/ukibuild.git` and pushes
-   `PKGBUILD`, `.SRCINFO`, and `ukibuild.install` if they changed.
+   `PKGBUILD`, `.SRCINFO`, and `ukibuild.install` if they changed. For a new
+   package the clone is empty and the **first push creates the package**.
 
 It does **not** push on every commit. A stable AUR package should change when
 the version changes, i.e. on a release tag. If you want every commit to be
@@ -30,30 +31,26 @@ available, publish a separate `ukibuild-git` package instead.
 
 ## First-time setup
 
-### 1. Create the AUR package
+### 1. AUR account and SSH key
 
-The workflow assumes `ssh://aur@aur.archlinux.org/ukibuild.git` already exists.
+You do **not** need to create the package in the AUR web interface. The first
+successful push creates it.
 
 - Create an AUR account.
 - Add your SSH public key to the AUR account.
-- Create the `ukibuild` package via the AUR web interface, or push an initial
-  commit manually.
 
-For the initial web upload, fill in the real owner/repo and checksum first:
+You can verify access before the first release:
 
 ```bash
-cd packaging/aur
-sed -i 's/^_owner=.*/_owner="your-github-user"/' PKGBUILD
-updpkgsums
-makepkg --printsrcinfo > .SRCINFO
+git -c init.defaultBranch=master clone ssh://aur@aur.archlinux.org/ukibuild.git
+# warning: You appear to have cloned an empty repository.
 ```
 
-Upload `PKGBUILD`, `.SRCINFO`, and `ukibuild.install` through the AUR web
-interface (or push them manually). After the package exists, the workflow can
-push to it.
+An empty clone is expected for a new package. Do not push from this test clone
+unless you want to create the package manually; the workflow does it.
 
-If you rename the package, also update `pkgname`, `install=`, and the
-`ukibuild.install` filename, then set the GitHub repository variable
+If the package name is already taken by another user, choose a different
+`pkgname`, `install=` filename, and set the GitHub repository variable
 `AUR_PACKAGE` (Settings → Variables → Actions). Otherwise it defaults to
 `ukibuild`.
 

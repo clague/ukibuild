@@ -376,9 +376,10 @@ packaging/aur/
 
 首次使用需要：
 
-- 在 AUR 创建 `ukibuild` 包
-- 把 AUR SSH 公钥加到 AUR 账户
+- AUR 账户，并把 AUR SSH 公钥加到账户
 - 在 GitHub 添加 `AUR_SSH_PRIVATE_KEY` secret
+
+不需要手动在 AUR 网页创建包：新包 clone 下来是空仓库，第一次 push 会自动创建。
 
 详细步骤见 `packaging/aur/README.md`。
 
