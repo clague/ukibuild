@@ -1,0 +1,25 @@
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = usr/lib/modules/*/vmlinuz
+Target = usr/lib/initcpio/*
+Target = usr/src/*/dkms.conf
+Target = usr/lib/systemd/boot/efi/*.efi.stub
+
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = intel-ucode
+Target = amd-ucode
+Target = systemd
+Target = systemd-ukify
+
+[Action]
+Description = Building and signing Unified Kernel Images...
+When = PostTransaction
+Exec = /usr/bin/ukibuild build --all --quiet
+Depends = systemd-ukify

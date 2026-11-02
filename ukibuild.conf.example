@@ -1,0 +1,75 @@
+# /etc/ukibuild.conf
+#
+# Every setting is optional. Defaults are shown explicitly below.
+# Uncomment a line to override it. Keep this file root-owned and not
+# writable by other users.
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+
+# Output root. Relative OUTPUT[name] values are resolved under here.
+# default: /efi/EFI/Linux
+#UKI_DIR="/efi/EFI/Linux"
+
+# Signing backend.
+# default: auto
+#   auto   = sbctl if set up, otherwise sbsign with /etc/efi-keys
+#   sbctl  = always sbctl
+#   sbsign = always sbsign
+#   none   = build unsigned (testing only)
+#SIGN_BACKEND="auto"
+
+# Global fallback kernel command line.
+# default: "" (unset; use /etc/kernel/<name>-cmdline, then /etc/kernel/cmdline)
+# Accepts a literal string, "@/path/to/file", or an existing file path.
+# Example value:
+#CMDLINE_DEFAULT="root=PARTLABEL=ROOT rw"
+
+# Prepend /boot/amd-ucode.img or /boot/intel-ucode.img when present.
+# default: 1
+# Set to 0 for a UKI with no .initrd section at all.
+#MICROCODE_AUTO=1
+
+# Keep the previous UKI as <output>.bak.
+# default: 1
+#BACKUP=1
+
+# Roots that must be real mountpoints before writing under them.
+# default: ("/efi" "/boot/efi")
+# Add "/boot" here if you use an XBOOTLDR partition.
+# Outputs outside every guard are allowed; explicit absolute OUTPUT paths
+# are treated as intentional. Set MOUNT_GUARDS=() to disable the check.
+#MOUNT_GUARDS=("/efi" "/boot/efi")
+
+# Extra ukify arguments.
+# default: ()
+# Example: use the .ucode section instead of .initrd:
+#UKIFY_EXTRA=("--microcode=/boot/amd-ucode.img")
+
+# sbsign fallback (only needed if you do not use sbctl).
+# defaults: KEY_DIR=/etc/efi-keys, KEY/CERT empty (auto-detect)
+#KEY_DIR="/etc/efi-keys"
+#KEY=""
+#CERT=""
+
+# ---------------------------------------------------------------------------
+# Per-kernel overrides
+# ---------------------------------------------------------------------------
+#
+# defaults: unset (auto-detect)
+#
+# CMDLINE[name]  literal string, "@/path/to/file", or an existing file path
+# INITRD[name]   whitespace-separated list; "none" or "" means no initramfs
+# OUTPUT[name]   relative to UKI_DIR, or an absolute path
+#
+# Without overrides:
+#   * cmdline comes from /etc/kernel/<name>-cmdline, then CMDLINE_DEFAULT,
+#     then /etc/kernel/cmdline
+#   * initramfs is /boot/initramfs-<name>.img if it exists
+#   * output is $UKI_DIR/<name>.efi
+#
+# Examples (for the standard "linux" kernel):
+#CMDLINE["linux"]="@/etc/kernel/cmdline"
+#INITRD["linux"]="none"          # use "none" to omit the initramfs
+#OUTPUT["linux"]="arch-linux.efi"

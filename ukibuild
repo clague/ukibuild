@@ -1,0 +1,832 @@
+#!/usr/bin/env bash
+#
+# ukibuild - build and sign Unified Kernel Images (UKI)
+#
+# Defaults are designed to work on a normal Arch system with the ESP at /efi:
+#
+#   * discover kernels in /boot/vmlinuz-* and /usr/lib/modules/*/vmlinuz
+#   * read /etc/kernel/<name>-cmdline, then CMDLINE_DEFAULT, then /etc/kernel/cmdline
+#   * use /boot/initramfs-<name>.img if it exists, otherwise no initramfs
+#   * prepend amd/intel microcode if present
+#   * sign with sbctl if set up, otherwise sbsign with /etc/efi-keys
+#
+# SPDX-License-Identifier: MIT
+#
+set -euo pipefail
+shopt -s nullglob
+
+readonly PROG="${0##*/}"
+readonly VERSION="0.3.0"
+readonly DEFAULT_CONFIG="/etc/ukibuild.conf"
+
+CONFIG="$DEFAULT_CONFIG"
+DRY_RUN=0
+VERBOSE=0
+QUIET=0
+COMMAND="build"
+declare -a SELECTED=()
+
+# ---------------------------------------------------------------------------
+# Defaults (may be overridden by the config file)
+# ---------------------------------------------------------------------------
+
+UKI_DIR=""                           # output root; default is /efi/EFI/Linux
+UKI_DIR_EXPLICIT=0
+MOUNT_GUARDS=("/efi" "/boot/efi")    # outputs here require a real mount
+SIGN_BACKEND="auto"                  # auto | sbctl | sbsign | none
+KEY_DIR="/etc/efi-keys"              # sbsign fallback
+KEY=""                               # optional explicit private key
+CERT=""                              # optional explicit certificate
+CMDLINE_DEFAULT=""                   # global fallback; string, @file, or file path
+MICROCODE_AUTO=1                     # prepend amd/intel ucode if present
+BACKUP=1                             # keep <output>.bak before replacing
+UKIFY="${UKIFY:-/usr/bin/ukify}"
+SBCTL="${SBCTL:-sbctl}"
+SBSIGN="${SBSIGN:-sbsign}"
+SBVERIFY="${SBVERIFY:-sbverify}"
+OS_RELEASE="${OS_RELEASE:-/etc/os-release}"
+UKIFY_EXTRA=()                       # optional extra ukify arguments
+
+# Per-kernel overrides.
+declare -A CMDLINE=()
+declare -A INITRD=()
+declare -A OUTPUT=()
+
+# ---------------------------------------------------------------------------
+# Internal state
+# ---------------------------------------------------------------------------
+
+RESOLVED_KERNEL=""
+RESOLVED_CMDLINE=""
+RESOLVED_OUTPUT=""
+RESOLVED_OUTPUT_EXPLICIT=0
+RESOLVED_INITRDS=()
+RESOLVED_SIGNER=""
+SIGNER_CACHE=""
+KERNEL_LIST=()
+DISCOVERED=()
+TMPFILES=()
+RUN_LOG=""
+
+cleanup() {
+    local f
+    for f in "${TMPFILES[@]}"; do
+        if [[ -n $f ]]; then
+            rm -f -- "$f"
+        fi
+    done
+}
+trap cleanup EXIT
+
+log()   { (( QUIET )) || printf '%s\n' "$*" >&2; }
+warn()  { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+die()   { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
+debug() { (( VERBOSE )) && printf '%s: %s\n' "$PROG" "$*" >&2 || true; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+run() {
+    if (( VERBOSE || DRY_RUN )); then
+        printf '+' >&2
+        printf ' %q' "$@" >&2
+        printf '\n' >&2
+    fi
+    if (( DRY_RUN )); then
+        return 0
+    fi
+    if (( QUIET )); then
+        if [[ -z $RUN_LOG ]]; then
+            RUN_LOG=$(mktemp) || return 1
+            TMPFILES+=("$RUN_LOG")
+        fi
+        : >"$RUN_LOG"
+        if ! "$@" >"$RUN_LOG" 2>&1; then
+            cat "$RUN_LOG" >&2
+            return 1
+        fi
+    else
+        "$@"
+    fi
+}
+
+require_cmd() {
+    if have "$1"; then
+        return 0
+    fi
+    if (( DRY_RUN )); then
+        warn "command not found: $1 (dry-run)"
+        return 0
+    fi
+    die "required command not found: $1"
+}
+
+require_ukify() {
+    require_cmd "$UKIFY"
+    if [[ ! -f $OS_RELEASE ]]; then
+        if (( DRY_RUN )); then
+            warn "os-release not found: $OS_RELEASE (dry-run)"
+        else
+            die "os-release not found: $OS_RELEASE"
+        fi
+    fi
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROG [options] [command] [kernel...]
+
+Commands:
+  build     Build and sign UKIs (default)
+  list      List discovered kernels and outputs
+  verify    Verify existing UKI signatures
+
+Options:
+  -c, --config FILE   Config file (default: $DEFAULT_CONFIG)
+  -n, --dry-run       Print what would be done, do not change anything
+  -v, --verbose       Show executed commands
+  -q, --quiet         Only warnings and errors
+      --all           Build every discovered kernel
+      --hook          Hook mode (--all --quiet)
+  -h, --help          Show this help
+      --version       Show version
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+check_config_security() {
+    local mode owner
+    mode=$(stat -Lc '%a' -- "$CONFIG" 2>/dev/null) || return 0
+    owner=$(stat -Lc '%u' -- "$CONFIG" 2>/dev/null) || return 0
+
+    if (( (8#$mode & 8#022) != 0 )); then
+        if (( EUID == 0 )); then
+            die "refusing to source group/world-writable config: $CONFIG"
+        fi
+        warn "config is group/world-writable: $CONFIG"
+    fi
+
+    if (( EUID == 0 && owner != 0 )); then
+        warn "config is not owned by root: $CONFIG"
+    fi
+}
+
+load_config() {
+    if [[ ! -f $CONFIG ]]; then
+        if [[ $CONFIG != "$DEFAULT_CONFIG" ]]; then
+            die "config file not found: $CONFIG"
+        fi
+        return 0
+    fi
+
+    check_config_security
+
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+}
+
+validate_paths() {
+    local g
+
+    [[ $UKI_DIR == /* ]] || die "UKI_DIR must be an absolute path: $UKI_DIR"
+    UKI_DIR=$(realpath -m -- "$UKI_DIR") || die "cannot resolve UKI_DIR: $UKI_DIR"
+
+    for g in "${MOUNT_GUARDS[@]}"; do
+        [[ $g == /* ]] || die "MOUNT_GUARDS entry must be absolute: $g"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Signing
+# ---------------------------------------------------------------------------
+
+sbctl_ready() {
+    have "$SBCTL" || return 1
+    local json
+    json=$("$SBCTL" setup --print-state --json 2>/dev/null) || return 1
+    grep -q '"installed"[[:space:]]*:[[:space:]]*true' <<<"$json"
+}
+
+# sbverify --list exits 0 even for unsigned files, so inspect its output.
+has_signature() {
+    local out
+    out=$("$SBVERIFY" --list "$1" 2>/dev/null) || return 1
+    grep -q '^signature' <<<"$out"
+}
+
+resolve_sbsign_paths() {
+    local f
+    if [[ -z $KEY ]]; then
+        for f in "$KEY_DIR/db.key" "$KEY_DIR/DB.key"; do
+            if [[ -f $f ]]; then KEY=$f; break; fi
+        done
+    fi
+    if [[ -z $CERT ]]; then
+        for f in "$KEY_DIR/db.crt" "$KEY_DIR/DB.crt" \
+                 "$KEY_DIR/db.pem" "$KEY_DIR/DB.pem"; do
+            if [[ -f $f ]]; then CERT=$f; break; fi
+        done
+    fi
+}
+
+# Sets RESOLVED_SIGNER. The result is cached: signing is global, not per-kernel.
+resolve_signer() {
+    if [[ -n $SIGNER_CACHE ]]; then
+        RESOLVED_SIGNER=$SIGNER_CACHE
+        return 0
+    fi
+
+    local backend
+    case $SIGN_BACKEND in
+        auto)
+            if sbctl_ready; then
+                backend="sbctl"
+            else
+                resolve_sbsign_paths
+                if [[ -n $KEY && -n $CERT && -f $KEY && -f $CERT ]]; then
+                    backend="sbsign"
+                else
+                    backend="none"
+                fi
+            fi
+            ;;
+        sbctl)
+            backend="sbctl"
+            ;;
+        sbsign)
+            resolve_sbsign_paths
+            backend="sbsign"
+            ;;
+        none)
+            backend="none"
+            ;;
+        *)
+            die "invalid SIGN_BACKEND: $SIGN_BACKEND"
+            ;;
+    esac
+
+    SIGNER_CACHE=$backend
+    RESOLVED_SIGNER=$backend
+}
+
+validate_signer() {
+    case $RESOLVED_SIGNER in
+        none)
+            if [[ $SIGN_BACKEND == auto ]]; then
+                if (( DRY_RUN )); then
+                    warn "no signing backend detected; dry-run shows an unsigned build"
+                else
+                    die "no signing backend available (sbctl not set up, no sbsign key/cert); set SIGN_BACKEND=none to build unsigned"
+                fi
+            fi
+            ;;
+        sbctl)
+            if [[ $SIGN_BACKEND != auto ]] && ! sbctl_ready; then
+                if (( DRY_RUN )); then
+                    warn "SIGN_BACKEND=sbctl but sbctl is not set up (dry-run)"
+                else
+                    die "SIGN_BACKEND=sbctl but sbctl is not set up"
+                fi
+            fi
+            ;;
+        sbsign)
+            if [[ -z $KEY || -z $CERT || ! -f $KEY || ! -f $CERT ]]; then
+                if (( DRY_RUN )); then
+                    warn "sbsign key/cert not found (dry-run)"
+                else
+                    die "sbsign key/cert not found (set KEY/CERT or KEY_DIR)"
+                fi
+            fi
+            ;;
+    esac
+}
+
+require_sbverify() {
+    require_cmd "$SBVERIFY"
+}
+
+sign_file() {
+    local src=$1 dest=$2 backend=$RESOLVED_SIGNER
+
+    if [[ -z $backend ]]; then
+        resolve_signer
+        backend=$RESOLVED_SIGNER
+    fi
+
+    case $backend in
+        sbctl)
+            run "$SBCTL" sign -o "$dest" "$src"
+            ;;
+        sbsign)
+            if (( ! DRY_RUN )); then
+                [[ -n $KEY && -f $KEY ]] || die "sbsign key not found (set KEY or KEY_DIR)"
+                [[ -n $CERT && -f $CERT ]] || die "sbsign certificate not found (set CERT or KEY_DIR)"
+            fi
+            run "$SBSIGN" --key "$KEY" --cert "$CERT" --output "$dest" "$src"
+            ;;
+        none)
+            run mv -f -- "$src" "$dest"
+            ;;
+        *)
+            die "unknown signing backend: $backend"
+            ;;
+    esac
+
+    if [[ $backend != none ]]; then
+        require_sbverify
+        if [[ $backend == sbsign ]]; then
+            run "$SBVERIFY" --cert "$CERT" "$dest" >/dev/null 2>&1 \
+                || die "signature verification failed: $dest"
+        elif (( ! DRY_RUN )) && ! has_signature "$dest"; then
+            die "signature verification failed: $dest"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Per-kernel resolution
+# ---------------------------------------------------------------------------
+
+kernel_pkgbase() {
+    local d=$1 name
+    if [[ -f ${d}pkgbase ]]; then
+        printf '%s' "$(<"${d}pkgbase")"
+    elif [[ -f ${d}kernelbase ]]; then
+        printf '%s' "$(<"${d}kernelbase")"
+    else
+        name=${d%/}
+        printf '%s' "${name##*/}"
+    fi
+}
+
+array_contains() {
+    local needle=$1 item
+    shift
+    for item in "$@"; do
+        if [[ $item == "$needle" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_kernel() {
+    local name=$1 d pkg
+    RESOLVED_KERNEL=""
+
+    if [[ -f /boot/vmlinuz-$name ]]; then
+        RESOLVED_KERNEL=/boot/vmlinuz-$name
+        return 0
+    fi
+
+    for d in /usr/lib/modules/*/; do
+        [[ -f ${d}vmlinuz ]] || continue
+        pkg=$(kernel_pkgbase "$d")
+        if [[ $pkg == "$name" ]]; then
+            RESOLVED_KERNEL="${d}vmlinuz"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+strip_cmdline_comments() {
+    awk '!/^[[:space:]]*#/' "$1"
+}
+
+normalize_cmdline() {
+    local s=$1
+    local -a parts=()
+    s=${s//$'\r'/}
+    s=${s//$'\n'/ }
+    read -r -a parts <<<"$s"
+    printf '%s' "${parts[*]}"
+}
+
+# Sets RESOLVED_CMDLINE. Precedence:
+#   1. CMDLINE[name]
+#   2. /etc/kernel/<name>-cmdline
+#   3. CMDLINE_DEFAULT
+#   4. /etc/kernel/cmdline
+# CMDLINE_DEFAULT and CMDLINE[name] accept a literal string, @/path/to/file,
+# or a path to an existing file.
+resolve_cmdline() {
+    local name=$1 v f
+
+    v="${CMDLINE["$name"]-__unset__}"
+
+    if [[ $v == "__unset__" || -z $v ]]; then
+        if [[ -f /etc/kernel/${name}-cmdline ]]; then
+            v="@/etc/kernel/${name}-cmdline"
+        elif [[ -n $CMDLINE_DEFAULT ]]; then
+            v=$CMDLINE_DEFAULT
+        elif [[ -f /etc/kernel/cmdline ]]; then
+            v="@/etc/kernel/cmdline"
+        else
+            die "no cmdline for '$name' (set CMDLINE[\"$name\"] or CMDLINE_DEFAULT, or create /etc/kernel/${name}-cmdline)"
+        fi
+    fi
+
+    if [[ $v == @* ]]; then
+        f=${v#@}
+        [[ -f $f ]] || die "cmdline file not found: $f"
+        v=$(strip_cmdline_comments "$f")
+    elif [[ -f $v ]]; then
+        v=$(strip_cmdline_comments "$v")
+    fi
+
+    v=$(normalize_cmdline "$v")
+    [[ -n $v ]] || die "empty cmdline for '$name'"
+    RESOLVED_CMDLINE=$v
+}
+
+# Sets RESOLVED_INITRDS.
+#   INITRD[name] unset      -> /boot/initramfs-<name>.img if it exists
+#   INITRD[name]=""|"none"  -> no initramfs
+#   INITRD[name]="a b"      -> use a and b
+resolve_initrds() {
+    local name=$1 spec f
+    local -a list=() new=()
+
+    spec="${INITRD["$name"]-__unset__}"
+
+    if [[ $spec == "__unset__" ]]; then
+        if [[ -f /boot/initramfs-$name.img ]]; then
+            list+=("/boot/initramfs-$name.img")
+        fi
+    elif [[ -n $spec && $spec != "none" && $spec != "null" ]]; then
+        read -r -a list <<<"$spec"
+    fi
+
+    if (( MICROCODE_AUTO )); then
+        for f in /boot/amd-ucode.img /boot/intel-ucode.img; do
+            [[ -f $f ]] || continue
+            if ! array_contains "$f" "${list[@]}"; then
+                new+=("$f")
+            fi
+        done
+    fi
+
+    RESOLVED_INITRDS=("${new[@]}" "${list[@]}")
+
+    for f in "${RESOLVED_INITRDS[@]}"; do
+        [[ -f $f ]] || die "initrd not found: $f"
+    done
+}
+
+resolve_output() {
+    local name=$1 o
+
+    o="${OUTPUT["$name"]:-}"
+    RESOLVED_OUTPUT_EXPLICIT=0
+
+    if [[ -z $o ]]; then
+        o="$UKI_DIR/$name.efi"
+    elif [[ $o == /* ]]; then
+        RESOLVED_OUTPUT_EXPLICIT=1
+    else
+        o="$UKI_DIR/$o"
+    fi
+
+    o=$(realpath -m -- "$o") || die "cannot resolve output path: $o"
+    RESOLVED_OUTPUT=$o
+}
+
+# Refuse to write under a guarded root when that root is not mounted.
+# Outputs outside every guard are allowed; explicit absolute OUTPUT paths are
+# treated as intentional and do not produce a warning.
+check_output_mount() {
+    local out=$1 explicit=${2:-0} co root cr best="" best_len=-1
+    local -a guards=("${MOUNT_GUARDS[@]}")
+
+    if (( ${#guards[@]} == 0 )); then
+        return 0
+    fi
+
+    co=$(realpath -m -- "$out") || die "cannot resolve output path: $out"
+
+    for root in "${guards[@]}"; do
+        cr=$(realpath -m -- "$root") || continue
+        if [[ $co == "$cr" || $co == "${cr%/}"/* ]]; then
+            if (( ${#cr} > best_len )); then
+                best=$cr
+                best_len=${#cr}
+            fi
+        fi
+    done
+
+    if [[ -z $best ]]; then
+        if (( explicit )); then
+            debug "output '$out' is outside MOUNT_GUARDS; skipping mount check"
+        else
+            warn "output '$out' is outside MOUNT_GUARDS; skipping mount check"
+        fi
+        return 0
+    fi
+
+    if have mountpoint; then
+        if ! mountpoint -q "$best"; then
+            if (( DRY_RUN )); then
+                warn "$best is not a mountpoint (dry-run)"
+            else
+                die "$best is not a mountpoint (not mounted?); refusing to write $out"
+            fi
+        fi
+    elif have findmnt; then
+        if ! findmnt -n -o TARGET --mountpoint "$best" >/dev/null 2>&1; then
+            if (( DRY_RUN )); then
+                warn "$best is not a mountpoint (dry-run)"
+            else
+                die "$best is not a mountpoint (not mounted?); refusing to write $out"
+            fi
+        fi
+    else
+        warn "cannot verify mountpoint for $best (mountpoint/findmnt missing)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Kernel discovery
+# ---------------------------------------------------------------------------
+
+discover_kernels() {
+    local -a names=()
+    local -A seen=()
+    local f d name
+
+    for f in /boot/vmlinuz-*; do
+        [[ -f $f ]] || continue
+        name=${f##*/vmlinuz-}
+        if [[ -n $name && -z ${seen[$name]:-} ]]; then
+            seen[$name]=1
+            names+=("$name")
+        fi
+    done
+
+    for d in /usr/lib/modules/*/; do
+        [[ -f ${d}vmlinuz ]] || continue
+        name=$(kernel_pkgbase "$d")
+        if [[ -n $name && -z ${seen[$name]:-} ]]; then
+            seen[$name]=1
+            names+=("$name")
+        fi
+    done
+
+    DISCOVERED=("${names[@]}")
+}
+
+build_kernel_list() {
+    local -a candidates=()
+    local -A seen=()
+    local n
+
+    if (( ${#SELECTED[@]} )); then
+        candidates=("${SELECTED[@]}")
+    else
+        discover_kernels
+        candidates=("${DISCOVERED[@]}")
+    fi
+
+    KERNEL_LIST=()
+    for n in "${candidates[@]}"; do
+        if [[ -n $n && -z ${seen[$n]:-} ]]; then
+            seen[$n]=1
+            KERNEL_LIST+=("$n")
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+build_one() {
+    local name=$1 kernel cmdline output backend tmp signed
+    local -a args=()
+    local i
+
+    resolve_kernel "$name" || die "kernel image not found for '$name'"
+    kernel=$RESOLVED_KERNEL
+    [[ -f $kernel ]] || die "kernel image not found: $kernel"
+
+    resolve_cmdline "$name"
+    cmdline=$RESOLVED_CMDLINE
+
+    resolve_initrds "$name"
+
+    resolve_output "$name"
+    output=$RESOLVED_OUTPUT
+    check_output_mount "$output" "$(( RESOLVED_OUTPUT_EXPLICIT || UKI_DIR_EXPLICIT ))"
+
+    backend=$RESOLVED_SIGNER
+
+    if (( DRY_RUN )); then
+        tmp="${output}.dry-run.efi"
+        signed="${tmp}.signed.efi"
+    else
+        run mkdir -p -- "$(dirname "$output")"
+        tmp=$(mktemp --tmpdir="$(dirname "$output")" ".${name}.XXXXXX.efi")
+        signed="${tmp}.signed.efi"
+        TMPFILES+=("$tmp" "$signed")
+    fi
+
+    args=(build --linux="$kernel" --cmdline="$cmdline" --os-release="@$OS_RELEASE")
+
+    for i in "${RESOLVED_INITRDS[@]}"; do
+        args+=(--initrd="$i")
+    done
+    if (( ${#UKIFY_EXTRA[@]} )); then
+        args+=("${UKIFY_EXTRA[@]}")
+    fi
+    args+=(--output="$tmp")
+
+    log "building $name"
+    log "  kernel:  $kernel"
+    log "  cmdline: $cmdline"
+    if (( ${#RESOLVED_INITRDS[@]} )); then
+        log "  initrd:  ${RESOLVED_INITRDS[*]}"
+    else
+        log "  initrd:  none"
+    fi
+    log "  output:  $output"
+    log "  sign:    $backend"
+
+    run "$UKIFY" "${args[@]}"
+    sign_file "$tmp" "$signed"
+
+    if (( BACKUP )); then
+        if [[ -f $output ]]; then
+            run cp -f -- "$output" "${output}.bak"
+        fi
+    fi
+
+    if (( ! DRY_RUN )); then
+        chmod 0644 -- "$signed" 2>/dev/null || true
+        sync -f -- "$signed" 2>/dev/null || true
+    fi
+    run mv -f -- "$signed" "$output"
+    log "built $output"
+}
+
+build_all() {
+    build_kernel_list
+    (( ${#KERNEL_LIST[@]} )) || die "no kernels found"
+
+    require_ukify
+    resolve_signer
+    validate_signer
+    if [[ $RESOLVED_SIGNER != none ]]; then
+        require_sbverify
+    fi
+
+    local n
+    for n in "${KERNEL_LIST[@]}"; do
+        build_one "$n"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Informational commands
+# ---------------------------------------------------------------------------
+
+list_all() {
+    build_kernel_list
+    (( ${#KERNEL_LIST[@]} )) || die "no kernels found"
+
+    resolve_signer
+    local sign=$RESOLVED_SIGNER
+    local n kernel out
+
+    printf '%-24s %-44s %-8s %s\n' "NAME" "KERNEL" "SIGN" "OUTPUT"
+    for n in "${KERNEL_LIST[@]}"; do
+        if resolve_kernel "$n"; then
+            kernel=$RESOLVED_KERNEL
+        else
+            kernel="(missing)"
+        fi
+        resolve_output "$n"
+        out=$RESOLVED_OUTPUT
+        printf '%-24s %-44s %-8s %s\n' "$n" "$kernel" "$sign" "$out"
+    done
+}
+
+verify_all() {
+    build_kernel_list
+    (( ${#KERNEL_LIST[@]} )) || die "no kernels found"
+
+    require_sbverify
+    resolve_signer
+    local sign=$RESOLVED_SIGNER
+    local n out rc=0
+
+    if [[ $sign == sbsign && ( -z $CERT || ! -f $CERT ) ]]; then
+        die "sbsign certificate not found (set CERT or KEY_DIR)"
+    fi
+
+    for n in "${KERNEL_LIST[@]}"; do
+        resolve_output "$n"
+        out=$RESOLVED_OUTPUT
+        if [[ ! -f $out ]]; then
+            warn "missing UKI: $out"
+            rc=1
+            continue
+        fi
+
+        if [[ $sign == sbsign ]]; then
+            if "$SBVERIFY" --cert "$CERT" "$out" >/dev/null 2>&1; then
+                log "ok: $out"
+            else
+                warn "signature verification failed: $out"
+                rc=1
+            fi
+        elif has_signature "$out"; then
+            log "ok: $out"
+        else
+            warn "unsigned or unreadable: $out"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+acquire_lock() {
+    (( DRY_RUN )) && return 0
+    have flock || return 0
+
+    local lock dir
+    if [[ -w /run ]]; then
+        lock="/run/ukibuild.lock"
+    else
+        dir="${XDG_RUNTIME_DIR:-${HOME:-${TMPDIR:-/tmp}}/.cache}"
+        mkdir -p -- "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}"
+        lock="$dir/ukibuild.lock"
+    fi
+
+    exec 9>"$lock" || die "cannot create lock file: $lock"
+    if ! flock -w 120 9; then
+        warn "another ukibuild instance is running; exiting"
+        exit 0
+    fi
+}
+
+main() {
+    local all=0
+
+    while (( $# )); do
+        case $1 in
+            -c|--config)
+                [[ $# -ge 2 ]] || die "missing argument for $1"
+                CONFIG=$2
+                shift 2
+                ;;
+            -n|--dry-run) DRY_RUN=1; shift ;;
+            -v|--verbose) VERBOSE=1; QUIET=0; shift ;;
+            -q|--quiet)   QUIET=1; VERBOSE=0; shift ;;
+            --all)        all=1; shift ;;
+            --hook)       COMMAND="build"; all=1; QUIET=1; shift ;;
+            -h|--help)    usage; exit 0 ;;
+            --version)    printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+            build|list|verify)
+                COMMAND=$1; shift ;;
+            --)
+                shift
+                while (( $# )); do SELECTED+=("$1"); shift; done
+                ;;
+            -*)
+                die "unknown option: $1 (try --help)" ;;
+            *)
+                SELECTED+=("$1"); shift ;;
+        esac
+    done
+
+    if (( all )); then
+        SELECTED=()
+    fi
+
+    load_config
+
+    if [[ -z $UKI_DIR ]]; then
+        UKI_DIR="/efi/EFI/Linux"
+    else
+        UKI_DIR_EXPLICIT=1
+    fi
+    validate_paths
+
+    acquire_lock
+
+    case $COMMAND in
+        build)  build_all ;;
+        list)   list_all ;;
+        verify) verify_all || exit 1 ;;
+        *)      die "unknown command: $COMMAND" ;;
+    esac
+}
+
+main "$@"

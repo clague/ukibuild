@@ -1,0 +1,18 @@
+[Unit]
+Description=Watch for kernel/initramfs changes and rebuild UKIs
+
+[Path]
+# /boot also covers initramfs and manually installed kernels such as
+# /boot/vmlinuz-linux.
+PathChanged=/boot
+PathChanged=/usr/lib/modules
+PathChanged=/usr/lib/systemd/boot/efi
+Unit=ukibuild.service
+
+# Do not enter failure mode during a large package transaction; ukibuild
+# itself serializes concurrent runs with flock.
+TriggerLimitIntervalSec=10
+TriggerLimitBurst=100
+
+[Install]
+WantedBy=paths.target

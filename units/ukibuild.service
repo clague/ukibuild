@@ -1,0 +1,16 @@
+[Unit]
+Description=Build and sign Unified Kernel Images
+Documentation=file:///usr/share/doc/ukibuild/README.md
+After=local-fs.target
+ConditionPathExists=/etc/ukibuild.conf
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+# Coalesce multiple writes from a kernel package or make install.
+ExecStartPre=-/usr/bin/sleep 2
+ExecStart=/usr/bin/ukibuild build --all --quiet
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

@@ -1,0 +1,130 @@
+name: Publish to AUR
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
+jobs:
+  aur:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: archlinux:latest
+      options: --user root
+    env:
+      AUR_PACKAGE: ${{ vars.AUR_PACKAGE || 'ukibuild' }}
+
+    steps:
+      # actions/checkout needs git before the workspace exists.
+      - name: Bootstrap container
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed \
+            base-devel git openssh pacman-contrib sudo curl
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare build user
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/builder
+          chmod 440 /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Update PKGBUILD metadata
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd packaging/aur
+
+          pkgver="${REF_NAME#v}"
+          if [[ ! $pkgver =~ ^[0-9] ]]; then
+            pkgver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          fi
+          pkgver="${pkgver//-/_}"
+          [[ $pkgver =~ ^[0-9][A-Za-z0-9._+]*$ ]] \
+            || { echo "::error::invalid pkgver: $pkgver"; exit 1; }
+
+          script_version=$(sed -n 's/^readonly VERSION="\(.*\)"/\1/p' ../../ukibuild)
+          if [[ $script_version != "$pkgver" ]]; then
+            echo "::error::tag/pkgver $pkgver does not match ukibuild VERSION $script_version"
+            exit 1
+          fi
+
+          sed -i "s/^pkgver=.*/pkgver=${pkgver}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^_owner=.*/_owner=\"${REPO_OWNER}\"/" PKGBUILD
+          sed -i "s/^_repo=.*/_repo=\"${REPO_NAME}\"/" PKGBUILD
+
+          echo "PKGVER=${pkgver}" >> "$GITHUB_ENV"
+          grep -E '^(pkgver|pkgrel|_owner|_repo)=' PKGBUILD
+
+      - name: Build package and generate .SRCINFO
+        run: |
+          set -euo pipefail
+          cd packaging/aur
+          sudo -u builder updpkgsums
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+          sudo -u builder makepkg -s -f --noconfirm
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z ${AUR_SSH_PRIVATE_KEY:-} ]]; then
+            echo "::error::AUR_SSH_PRIVATE_KEY is not set"
+            exit 1
+          fi
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" >~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >>~/.ssh/known_hosts
+          cat >~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+          git config --global user.name "AUR Publisher"
+          git config --global user.email "aur@localhost"
+          git config --global init.defaultBranch master
+
+          rm -rf /tmp/aur
+          if ! git clone "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" /tmp/aur; then
+            echo "::error::AUR package '${AUR_PACKAGE}' does not exist; create it first"
+            exit 1
+          fi
+
+          install -m 644 packaging/aur/PKGBUILD /tmp/aur/PKGBUILD
+          install -m 644 packaging/aur/.SRCINFO /tmp/aur/.SRCINFO
+          install -m 644 packaging/aur/ukibuild.install /tmp/aur/ukibuild.install
+
+          cd /tmp/aur
+          git add PKGBUILD .SRCINFO ukibuild.install
+          if git diff --cached --quiet; then
+            echo "AUR package is already up to date."
+            exit 0
+          fi
+
+          git commit -m "Update to ${PKGVER}"
+          git push origin master
