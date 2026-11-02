@@ -128,6 +128,16 @@ jobs:
           EOF
           chmod 600 ~/.ssh/config
 
+          ssh -vv -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -T aur@aur.archlinux.org \
+            >/tmp/aur-ssh.log 2>&1 || true
+          if grep -q 'Authentication succeeded' /tmp/aur-ssh.log; then
+            echo "::notice::AUR SSH authentication succeeded"
+          else
+            ssh_detail=$(grep -E 'Offering public key|Server accepts key|Permission denied|Connection|Host key|no mutual|Authentications that can continue' /tmp/aur-ssh.log | tail -n 8 | tr '\n' ' ')
+            echo "::warning::AUR SSH authentication did not succeed: $ssh_detail"
+          fi
+
           git config --global user.name "AUR Publisher"
           git config --global user.email "aur@localhost"
           git config --global init.defaultBranch master
@@ -135,10 +145,11 @@ jobs:
           rm -rf /tmp/aur
           # A new package is cloned as an empty repository; the first push
           # creates it. A failure here means SSH authentication is wrong.
+          echo "::notice::AUR clone URL: ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git"
           if ! clone_out=$(git -c init.defaultBranch=master clone \
                 "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" /tmp/aur 2>&1); then
             printf '%s\n' "$clone_out"
-            detail=$(printf '%s\n' "$clone_out" | tail -n 3 | tr '\n' ' ')
+            detail=$(printf '%s\n' "$clone_out" | tr '\n' ' ')
             echo "::error::AUR clone failed: $detail"
             exit 1
           fi
