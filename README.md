@@ -1,5 +1,7 @@
 # ukibuild
 
+[English](README.en.md) | 简体中文
+
 一个极简的 UKI（Unified Kernel Image）构建与签名工具。
 
 - 用 `ukify` 把 kernel、可选的 initrd、cmdline 打包成 `.efi`
@@ -407,6 +409,7 @@ ukibuild/
 │   └── README.md
 ├── .github/workflows/aur.yml         # tag -> AUR 发布
 ├── Makefile
-├── README.md
+├── README.md                         # 中文
+├── README.en.md                      # English
 └── LICENSE
 ```

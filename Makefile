@@ -32,6 +32,7 @@ install:
 	install -Dm644 units/ukibuild.service $(UNITDIR)/ukibuild.service
 	install -Dm644 units/ukibuild.path $(UNITDIR)/ukibuild.path
 	install -Dm644 README.md $(DOCDIR)/README.md
+	install -Dm644 README.en.md $(DOCDIR)/README.en.md
 	install -Dm644 LICENSE $(DOCDIR)/LICENSE
 	@if [ ! -e "$(CONFDIR)/ukibuild.conf" ]; then \
 		install -Dm644 ukibuild.conf.example "$(CONFDIR)/ukibuild.conf"; \
@@ -51,6 +52,6 @@ uninstall:
 	rm -f $(BINDIR)/ukibuild
 	rm -f $(HOOKDIR)/95-ukibuild.hook
 	rm -f $(UNITDIR)/ukibuild.service $(UNITDIR)/ukibuild.path
-	rm -f $(DOCDIR)/README.md $(DOCDIR)/LICENSE
+	rm -f $(DOCDIR)/README.md $(DOCDIR)/README.en.md $(DOCDIR)/LICENSE
 	@if [ -z "$(DESTDIR)" ]; then systemctl daemon-reload; fi
 	@echo "config kept at $(CONFDIR)/ukibuild.conf"
