@@ -81,8 +81,7 @@ MICROCODE_AUTO=0
 BACKUP=0
 ```
 
-输出就是 `/boot/linux.efi` 和 `/boot/linux-lts.efi`。`/boot` 不在默认
-`MOUNT_GUARDS` 里，但因为 `UKI_DIR` 是显式设置的，不会触发警告。
+输出就是 `/boot/linux.efi` 和 `/boot/linux-lts.efi`。
 
 如果想把输出命名成 `arch-*`：
 
@@ -91,24 +90,9 @@ OUTPUT["linux"]="arch-linux.efi"
 OUTPUT["linux-lts"]="arch-linux-lts.efi"
 ```
 
-### 从旧配置迁移
-
-旧版本的 `ESP_DIR` + `OUT_DIR` 合并成一个 `UKI_DIR`：
-
-```bash
-# 旧
-ESP_DIR="/efi"
-OUT_DIR="EFI/Linux"
-
-# 新
-UKI_DIR="/efi/EFI/Linux"
-```
-
-`AUTO_DISCOVER`、`KERNELS`、`ENABLED`、`KERNEL`、`SPLASH`、`SIGN[name]`、`EXTRA_SIGN`、`CMDLINE_DEFAULT_FILE` 已移除，留在配置里会被忽略。`CMDLINE_DEFAULT` 仍然支持。
-
 ---
 
-## 配置参考
+## 配置
 
 ### 全局
 
@@ -142,19 +126,12 @@ UKI_DIR="/efi/EFI/Linux"
 `CMDLINE[name]` 和 `CMDLINE_DEFAULT` 都接受三种写法：
 
 ```bash
-# 字面字符串
 CMDLINE_DEFAULT="root=PARTLABEL=ROOT rw"
-
-# @ 前缀
 CMDLINE_DEFAULT="@/etc/kernel/cmdline"
-
-# 已存在的文件路径
 CMDLINE_DEFAULT="/etc/kernel/cmdline"
 ```
 
-文件里的整行 `#` 注释会被忽略，多行会压成一行。
-
-`CMDLINE_DEFAULT` 是回退值，优先级低于 `/etc/kernel/<name>-cmdline`。想让全局值覆盖所有内核，显式设置 `CMDLINE[name]`，或移除对应的 per-kernel 文件。
+文件里的整行 `#` 注释会被忽略，多行会压成一行。`CMDLINE_DEFAULT` 是回退值，优先级低于 `/etc/kernel/<name>-cmdline`。
 
 ### initrd 规则
 
@@ -192,11 +169,8 @@ UKI_DIR="/efi/EFI/Linux"
 也可以放 XBOOTLDR 或根分区：
 
 ```bash
-# XBOOTLDR 挂载在 /boot
-UKI_DIR="/boot/EFI/Linux"
-
-# 根分区 / 其他分区
-UKI_DIR="/data/uki"
+UKI_DIR="/boot/EFI/Linux"   # XBOOTLDR 挂载在 /boot
+UKI_DIR="/data/uki"         # 根分区或其他分区
 ```
 
 `OUTPUT[name]` 也支持绝对路径：
@@ -213,22 +187,10 @@ OUTPUT["linux"]="/data/uki/arch-linux.efi"
 MOUNT_GUARDS=("/efi" "/boot/efi")
 ```
 
-- 输出在某个 guard 下，但该 guard 没挂载 → **报错**，避免把 UKI 写到 rootfs 上的同名空目录。
-- 输出不在任何 guard 下 → 继续。显式写了绝对 `OUTPUT` 时不警告（视为有意选择）；否则警告。
-- `MOUNT_GUARDS=()` → 完全关闭检查。
+- 输出在某个 guard 下，但该 guard 没挂载 → **报错**。
+- 输出不在任何 guard 下 → 继续；显式绝对 `OUTPUT` 不警告。
+- `MOUNT_GUARDS=()` → 关闭检查。
 - 用 XBOOTLDR 时把 `"/boot"` 加进去。
-
-例如把 UKI 放在 rootfs 的 `/boot`：
-
-```bash
-OUTPUT["linux"]="/boot/linux.efi"
-```
-
-因为 `/boot` 不在默认 guard 里，而且是显式绝对路径，所以不会报错也不会警告。如果你希望 `/boot` 必须是挂载点，就加：
-
-```bash
-MOUNT_GUARDS=("/efi" "/boot/efi" "/boot")
-```
 
 > UKI 不在 ESP 时，固件不能直接加载它：XBOOTLDR 需要 systemd-boot；btrfs/ext4 需要 rEFInd/GRUB 的文件系统驱动，并且引导器和驱动都要被 Secure Boot 信任。
 
@@ -264,17 +226,8 @@ CERT="/etc/efi-keys/db.crt"
 
 ## 自动触发
 
-### pacman hook
-
-内核、initcpio、DKMS、systemd stub、ucode 更新时执行：
-
-```bash
-/usr/bin/ukibuild build --all --quiet
-```
-
-### systemd path unit
-
-监听 `/boot`、`/usr/lib/modules`、`/usr/lib/systemd/boot/efi`，手动 `make install` 的内核也会触发。`flock` 防止并发，service 启动前 `sleep 2` 合并同一批写入。
+- **pacman hook**：内核、initcpio、DKMS、systemd stub、ucode 更新时自动执行。
+- **systemd path unit**：监听 `/boot`、`/usr/lib/modules`、`/usr/lib/systemd/boot/efi`，手动安装的内核也会触发。
 
 ```bash
 systemctl status ukibuild.path
@@ -308,27 +261,11 @@ ukibuild build -n -v       # 空跑并打印命令
 
 ---
 
-## 工作流程
-
-1. 解析 kernel / cmdline / initrd / output
-2. 检查输出所在挂载点
-3. `ukify build` 到临时文件
-4. 用 sbctl 或 sbsign 签另一个临时文件
-5. `sbverify` 验证
-6. 可选保留 `.bak`
-7. `fsync` 后 `mv` 原子替换
-
----
-
 ## 安全与注意事项
 
-- 配置文件以 root 身份 source，权限保持 `root:root 0644`。root 下会拒绝 group/world-writable 的配置，非 root 只警告。
+- 配置文件以 root 身份 source，权限保持 `root:root 0644`。
 - `UKI_DIR` 和 `MOUNT_GUARDS` 里的路径必须是绝对路径。
-- 无 initramfs 启动要求根文件系统、存储控制器等驱动**编进内核**（`=y`）。检查：
-  ```bash
-  /usr/src/linux/scripts/extract-ikconfig /boot/vmlinuz-linux \
-    | grep -E 'CONFIG_(BLK_DEV_NVME|NVME_CORE|BTRFS_FS)='
-  ```
+- 无 initramfs 启动要求根文件系统、存储控制器等驱动**编进内核**（`=y`）。
 - `MICROCODE_AUTO=1` 时，即使 `INITRD="none"`，`.initrd` 里也只有一个微码 cpio，不是根 initramfs。
 - `BACKUP=1` 会多占一份 UKI 的空间；ESP 紧张时设 `0`。
 - 改 cmdline 后必须重建；Secure Boot 下启动菜单传参无效。
@@ -356,61 +293,6 @@ journalctl -u ukibuild.service -b
 
 ---
 
-## AUR 发布
+## License
 
-AUR 打包文件在 `packaging/aur/`：
-
-```bash
-packaging/aur/
-├── PKGBUILD
-├── ukibuild.install
-└── README.md
-```
-
-`.github/workflows/aur.yml` 会在推送 `v*` tag（或手动触发）时：
-
-1. 在 Arch 容器里构建并校验包
-2. 自动填充 `pkgver`、`_owner`、`_repo`、`sha256sums`
-3. 生成 `.SRCINFO`
-4. 推送到 `ssh://aur@aur.archlinux.org/ukibuild.git`
-
-首次使用需要：
-
-- AUR 账户，并把 AUR SSH 公钥加到账户
-- 在 GitHub 添加 `AUR_SSH_PRIVATE_KEY` secret
-
-不需要手动在 AUR 网页创建包：新包 clone 下来是空仓库，第一次 push 会自动创建。
-
-详细步骤见 `packaging/aur/README.md`。
-
-> 这是稳定版包，按 tag 发布。如果你想每次 commit 都自动更新 AUR，应该另做一个 `ukibuild-git` 包。
-
-## 开发与测试
-
-```bash
-make check    # bash -n + shellcheck（如果安装）
-make test     # 临时密钥构建无 initramfs UKI，签名并验证
-```
-
----
-
-## 目录结构
-
-```
-ukibuild/
-├── ukibuild                          # 主程序
-├── ukibuild.conf.example             # 配置示例
-├── hooks/95-ukibuild.hook            # pacman hook
-├── units/ukibuild.service            # systemd oneshot
-├── units/ukibuild.path               # systemd path watcher
-├── tests/smoke.sh                    # 冒烟测试
-├── packaging/aur/                    # AUR 打包
-│   ├── PKGBUILD
-│   ├── ukibuild.install
-│   └── README.md
-├── .github/workflows/aur.yml         # tag -> AUR 发布
-├── Makefile
-├── README.md                         # 中文
-├── README.en.md                      # English
-└── LICENSE
-```
+MIT

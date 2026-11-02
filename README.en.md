@@ -89,9 +89,7 @@ MICROCODE_AUTO=0
 BACKUP=0
 ```
 
-The outputs are `/boot/linux.efi` and `/boot/linux-lts.efi`. `/boot` is not in
-the default `MOUNT_GUARDS`, but since `UKI_DIR` is explicitly set, no warning
-is emitted.
+The outputs are `/boot/linux.efi` and `/boot/linux-lts.efi`.
 
 To name the outputs `arch-*`:
 
@@ -100,26 +98,9 @@ OUTPUT["linux"]="arch-linux.efi"
 OUTPUT["linux-lts"]="arch-linux-lts.efi"
 ```
 
-### Migrating from an old configuration
-
-The old `ESP_DIR` + `OUT_DIR` pair is now a single `UKI_DIR`:
-
-```bash
-# old
-ESP_DIR="/efi"
-OUT_DIR="EFI/Linux"
-
-# new
-UKI_DIR="/efi/EFI/Linux"
-```
-
-`AUTO_DISCOVER`, `KERNELS`, `ENABLED`, `KERNEL`, `SPLASH`, `SIGN[name]`,
-`EXTRA_SIGN`, and `CMDLINE_DEFAULT_FILE` were removed and are ignored if left
-in a config. `CMDLINE_DEFAULT` is still supported.
-
 ---
 
-## Configuration reference
+## Configuration
 
 ### Global
 
@@ -153,22 +134,14 @@ in a config. `CMDLINE_DEFAULT` is still supported.
 `CMDLINE[name]` and `CMDLINE_DEFAULT` accept three forms:
 
 ```bash
-# literal string
 CMDLINE_DEFAULT="root=PARTLABEL=ROOT rw"
-
-# @ prefix
 CMDLINE_DEFAULT="@/etc/kernel/cmdline"
-
-# path to an existing file
 CMDLINE_DEFAULT="/etc/kernel/cmdline"
 ```
 
 Full-line `#` comments in files are ignored, and multiple lines are collapsed
-into one.
-
-`CMDLINE_DEFAULT` is a fallback: it has lower priority than
-`/etc/kernel/<name>-cmdline`. To make the global value win, set
-`CMDLINE[name]` explicitly or remove the per-kernel file.
+into one. `CMDLINE_DEFAULT` is a fallback: it has lower priority than
+`/etc/kernel/<name>-cmdline`.
 
 ### initrd rules
 
@@ -206,11 +179,8 @@ UKI_DIR="/efi/EFI/Linux"
 You can also use XBOOTLDR or the root filesystem:
 
 ```bash
-# XBOOTLDR mounted at /boot
-UKI_DIR="/boot/EFI/Linux"
-
-# root filesystem or another partition
-UKI_DIR="/data/uki"
+UKI_DIR="/boot/EFI/Linux"   # XBOOTLDR mounted at /boot
+UKI_DIR="/data/uki"         # root filesystem or another partition
 ```
 
 `OUTPUT[name]` also accepts absolute paths:
@@ -228,27 +198,11 @@ Before writing, `ukibuild` runs `mountpoint -q` on each root in
 MOUNT_GUARDS=("/efi" "/boot/efi")
 ```
 
-- Output under a guard, but the guard is not mounted → **error**, preventing a
-  UKI from being written into an empty same-named directory on the root
-  filesystem.
-- Output outside every guard → continue. Explicit absolute `OUTPUT` paths are
-  treated as intentional and do not warn; otherwise a warning is emitted.
-- `MOUNT_GUARDS=()` → disable the check completely.
+- Output under a guard, but the guard is not mounted → **error**.
+- Output outside every guard → continue; explicit absolute `OUTPUT` paths do
+  not warn.
+- `MOUNT_GUARDS=()` → disable the check.
 - When using XBOOTLDR, add `"/boot"`.
-
-For example, placing a UKI on the root filesystem under `/boot`:
-
-```bash
-OUTPUT["linux"]="/boot/linux.efi"
-```
-
-Because `/boot` is not in the default guards and this is an explicit absolute
-path, there is no error and no warning. If you want `/boot` to be a required
-mountpoint, add it:
-
-```bash
-MOUNT_GUARDS=("/efi" "/boot/efi" "/boot")
-```
 
 > When a UKI is not on the ESP, the firmware cannot load it directly:
 > XBOOTLDR requires systemd-boot; btrfs/ext4 requires rEFInd/GRUB filesystem
@@ -290,19 +244,11 @@ CERT="/etc/efi-keys/db.crt"
 
 ## Automatic triggers
 
-### pacman hook
-
-Runs when kernels, initcpio, DKMS, the systemd stub, or microcode change:
-
-```bash
-/usr/bin/ukibuild build --all --quiet
-```
-
-### systemd path unit
-
-Watches `/boot`, `/usr/lib/modules`, and `/usr/lib/systemd/boot/efi`, so
-manually installed kernels also trigger a rebuild. `flock` prevents concurrent
-runs, and the service sleeps for 2 seconds to coalesce one batch of writes.
+- **pacman hook**: runs on kernel, initcpio, DKMS, systemd stub, and microcode
+  updates.
+- **systemd path unit**: watches `/boot`, `/usr/lib/modules`, and
+  `/usr/lib/systemd/boot/efi`, so manually installed kernels also trigger a
+  rebuild.
 
 ```bash
 systemctl status ukibuild.path
@@ -336,29 +282,12 @@ A non-zero exit code means failure; the old UKI is not overwritten.
 
 ---
 
-## Workflow
-
-1. Resolve kernel / cmdline / initrd / output
-2. Check the output mountpoint
-3. `ukify build` into a temporary file
-4. Sign into another temporary file with sbctl or sbsign
-5. Verify with `sbverify`
-6. Optionally keep a `.bak`
-7. `fsync` and atomically `mv` into place
-
----
-
 ## Security notes
 
-- The config is sourced as root; keep it `root:root 0644`. When run as root,
-  group/world-writable configs are rejected; as a normal user they only warn.
+- The config is sourced as root; keep it `root:root 0644`.
 - Paths in `UKI_DIR` and `MOUNT_GUARDS` must be absolute.
 - Booting without an initramfs requires the root filesystem, storage
-  controller, and other drivers to be built into the kernel (`=y`). Check:
-  ```bash
-  /usr/src/linux/scripts/extract-ikconfig /boot/vmlinuz-linux \
-    | grep -E 'CONFIG_(BLK_DEV_NVME|NVME_CORE|BTRFS_FS)='
-  ```
+  controller, and other drivers to be built into the kernel (`=y`).
 - With `MICROCODE_AUTO=1`, even `INITRD="none"` leaves a microcode-only cpio in
   `.initrd`; this is not a root initramfs.
 - `BACKUP=1` uses another full UKI's worth of space; set `0` if the ESP is
@@ -390,65 +319,6 @@ journalctl -u ukibuild.service -b
 
 ---
 
-## AUR publishing
+## License
 
-AUR packaging lives in `packaging/aur/`:
-
-```bash
-packaging/aur/
-├── PKGBUILD
-├── ukibuild.install
-└── README.md
-```
-
-`.github/workflows/aur.yml` runs on a `v*` tag (or manually) and:
-
-1. Builds and validates the package in an Arch container
-2. Fills in `pkgver`, `_owner`, `_repo`, and `sha256sums`
-3. Generates `.SRCINFO`
-4. Pushes to `ssh://aur@aur.archlinux.org/ukibuild.git`
-
-First-time setup:
-
-- Have an AUR account and add the AUR SSH public key to it
-- Add the `AUR_SSH_PRIVATE_KEY` secret on GitHub
-
-You do **not** need to create the package in the AUR web interface. A new
-package clones as an empty repository, and the first push creates it.
-
-See `packaging/aur/README.md` for details.
-
-> This is a stable package, released by tag. If you want every commit to update
-> AUR automatically, create a separate `ukibuild-git` package instead.
-
----
-
-## Development and testing
-
-```bash
-make check    # bash -n + shellcheck (if installed) + PKGBUILD validation
-make test     # build an initramfs-less UKI with a temporary key and verify it
-```
-
----
-
-## Directory layout
-
-```
-ukibuild/
-├── ukibuild                          # main program
-├── ukibuild.conf.example             # configuration example
-├── hooks/95-ukibuild.hook            # pacman hook
-├── units/ukibuild.service            # systemd oneshot
-├── units/ukibuild.path               # systemd path watcher
-├── tests/smoke.sh                    # smoke test
-├── packaging/aur/                    # AUR packaging
-│   ├── PKGBUILD
-│   ├── ukibuild.install
-│   └── README.md
-├── .github/workflows/aur.yml         # tag -> AUR publishing
-├── Makefile
-├── README.md                         # Chinese README
-├── README.en.md                      # this file
-└── LICENSE
-```
+MIT
