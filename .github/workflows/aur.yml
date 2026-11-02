@@ -115,21 +115,17 @@ jobs:
           key_fp=$(ssh-keygen -lf /tmp/aur.pub | awk '{print $2}')
           echo "::notice::AUR SSH key fingerprint: $key_fp"
 
-          if ! ssh-keyscan aur.archlinux.org >>~/.ssh/known_hosts 2>/dev/null; then
-            echo "::error::ssh-keyscan aur.archlinux.org failed"
-            exit 1
-          fi
           cat >~/.ssh/config <<'EOF'
           Host aur.archlinux.org
             User aur
             IdentityFile ~/.ssh/aur
             IdentitiesOnly yes
-            StrictHostKeyChecking yes
+            StrictHostKeyChecking accept-new
           EOF
           chmod 600 ~/.ssh/config
 
           ssh -vv -o BatchMode=yes -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes -T aur@aur.archlinux.org \
+            -o StrictHostKeyChecking=accept-new -T aur@aur.archlinux.org \
             >/tmp/aur-ssh.log 2>&1 || true
           if grep -q 'Authentication succeeded' /tmp/aur-ssh.log; then
             echo "::notice::AUR SSH authentication succeeded"
